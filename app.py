@@ -19,7 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_TITLE = "AUTOMATIZACION_BN"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 DISPLAY_COLS = ["codigo", "nombre", "incidente", "fecha", "hora", "estado", "detalle"]
 COL_TITLES = {
     "codigo": "Código",
@@ -106,8 +106,9 @@ DEFAULT_DELAYS = {
 # Fallbacks geométricos. Se usan sólo para controles antiguos que el mapa no expone.
 # El botón Buscar no apareció como control individual en UI Automation.
 FALLBACK = {
-    # Dentro de FNFIXEDBAR105, el botón Buscar está aprox. a 335 px desde la izquierda.
-    "toolbar_buscar_offset": (335, 18),
+    # El clic por coordenada del botón Buscar queda deshabilitado por defecto.
+    # En una prueba real, el offset anterior abrió "Imprimir".
+    "toolbar_buscar_offset": None,
     # Dentro del PBTabControl32_100, cabecera de la pestaña Marcaciones.
     "marcaciones_tab_points": [(0.355, 0.030), (0.330, 0.030), (0.385, 0.030)],
     # Dentro del pbdw105 de "Nuevo Marcación".
@@ -442,8 +443,64 @@ class AttendanceAutomator:
             class_name=SYGNUS["find_class"],
         )
 
+    def _invoke_native_menu_by_text(self, target_text: str) -> bool:
+        """Busca recursivamente un elemento del menú Win32 por texto y envía WM_COMMAND.
+
+        Esto evita depender de la posición del botón de la barra. Es especialmente útil
+        en PowerBuilder, donde los botones de la toolbar pueden no aparecer en UI Automation.
+        """
+        import ctypes
+
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            hwnd = int(self.main.handle)
+            hmenu = user32.GetMenu(hwnd)
+            if not hmenu:
+                return False
+
+            MF_BYPOSITION = 0x00000400
+            WM_COMMAND = 0x0111
+            target = target_text.replace("&", "").strip().casefold()
+
+            def clean(text: str) -> str:
+                return text.replace("&", "").split("\t", 1)[0].strip()
+
+            def walk(menu, path=()):
+                count = user32.GetMenuItemCount(menu)
+                if count < 0:
+                    return None
+                for pos in range(count):
+                    buf = ctypes.create_unicode_buffer(512)
+                    user32.GetMenuStringW(menu, pos, buf, len(buf), MF_BYPOSITION)
+                    raw = buf.value or ""
+                    label = clean(raw)
+                    submenu = user32.GetSubMenu(menu, pos)
+
+                    if submenu:
+                        found = walk(submenu, path + (label,))
+                        if found:
+                            return found
+
+                    if label and target == label.casefold():
+                        cmd_id = user32.GetMenuItemID(menu, pos)
+                        if cmd_id not in (-1, 0xFFFFFFFF):
+                            return int(cmd_id), path + (label,)
+                return None
+
+            found = walk(hmenu)
+            if not found:
+                return False
+
+            cmd_id, path = found
+            self.log(f"Invocando menú nativo: {' > '.join(path)} (ID={cmd_id})")
+            user32.SendMessageW(hwnd, WM_COMMAND, cmd_id, 0)
+            return True
+        except Exception as exc:
+            self.log(f"Menú nativo no disponible: {exc}")
+            return False
+
     def _open_find(self):
-        from pywinauto import mouse
+        from pywinauto.keyboard import send_keys
 
         self._check_cancel()
         existing = self._find_spec()
@@ -451,29 +508,56 @@ class AttendanceAutomator:
             return existing.wrapper_object()
 
         self.log("Abriendo Buscar...")
-
-        # 1) Intenta usar el menú nativo: evita depender del mouse.
         opened = False
-        for menu_path in ("Acciones->Buscar", "Acciones->Buscar...", "Buscar"):
+
+        # 1) Primero invoca el comando Buscar directamente desde el menú Win32.
+        #    No depende de coordenadas ni de que el botón de toolbar sea visible a UI Automation.
+        if self._invoke_native_menu_by_text("Buscar"):
+            self._sleep("short")
+            opened = self._spec_exists(self._find_spec(), timeout=1.0)
+
+        # 2) Segundo intento: rutas de menú que pywinauto pueda reconocer.
+        if not opened:
+            for menu_path in (
+                "Acciones->Buscar",
+                "Acciones->Buscar...",
+                "Lista->Buscar",
+                "Lista->Buscar...",
+            ):
+                try:
+                    self.main.menu_select(menu_path)
+                    self._sleep("short")
+                    if self._spec_exists(self._find_spec(), timeout=0.8):
+                        self.log(f"Buscar abierto mediante menú: {menu_path}")
+                        opened = True
+                        break
+                except Exception:
+                    pass
+
+        # 3) Tercer intento seguro: Ctrl+F.
+        if not opened:
             try:
-                self.main.menu_select(menu_path)
+                self.main.set_focus()
+            except Exception:
+                pass
+            try:
+                send_keys("^f")
                 self._sleep("short")
-                if self._spec_exists(self._find_spec(), timeout=0.6):
+                if self._spec_exists(self._find_spec(), timeout=1.0):
+                    self.log("Buscar abierto mediante Ctrl+F.")
                     opened = True
-                    break
             except Exception:
                 pass
 
-        # 2) Fallback al botón de la barra. El mapa expone la barra FNFIXEDBAR105,
-        #    pero no el botón Buscar como nodo independiente.
+        # IMPORTANTE: ya no hacemos clic ciego en la barra. En la prueba anterior
+        # ese fallback abrió la ventana Imprimir. Es mejor detenerse que ejecutar
+        # una acción incorrecta sobre SYGNUS.
         if not opened:
-            try:
-                bar = self._child(self.main, class_name="FNFIXEDBAR105").wrapper_object()
-                rect = bar.rectangle()
-                dx, dy = FALLBACK["toolbar_buscar_offset"]
-                mouse.click(coords=(rect.left + dx, rect.top + dy))
-            except Exception as exc:
-                raise RuntimeError("No se pudo accionar el botón Buscar.") from exc
+            raise RuntimeError(
+                "No se pudo abrir la ventana Find. El sistema sí está conectado, "
+                "pero el comando Buscar no pudo invocarse por menú ni con Ctrl+F. "
+                "Se deshabilitó el clic por coordenadas porque abrió Imprimir en la prueba anterior."
+            )
 
         find_spec = self._find_spec()
         find_spec.wait("exists visible", timeout=5)
