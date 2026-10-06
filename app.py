@@ -19,7 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_TITLE = "AUTOMATIZACION_BN"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 DISPLAY_COLS = ["codigo", "nombre", "incidente", "fecha", "hora", "estado", "detalle"]
 COL_TITLES = {
     "codigo": "Código",
@@ -321,6 +321,7 @@ class AttendanceAutomator:
         self.cancel_event = cancel_event
         self.delays = load_delays()
         self.main = None
+        self.main_spec = None
         self.pid = None
 
     def _check_cancel(self):
@@ -371,6 +372,7 @@ class AttendanceAutomator:
                 f"Ventanas visibles: {sample}"
             ) from exc
 
+        self.main_spec = main
         self.main = main.wrapper_object()
         try:
             self.pid = self.main.process_id()
@@ -394,8 +396,31 @@ class AttendanceAutomator:
         self.log(f"Conectado a Maestra de Asistencia.{pid_text}")
         return self.pid
 
+    @staticmethod
+    def _as_spec(obj):
+        """Convierte un Wrapper de pywinauto en WindowSpecification.
+
+        En backend win32, wrapper_object() devuelve DialogWrapper/HwndWrapper.
+        Esos wrappers NO tienen child_window(); child_window() pertenece a
+        WindowSpecification. Esta función permite trabajar con ambos tipos.
+        """
+        from pywinauto import Desktop
+
+        if hasattr(obj, "child_window"):
+            return obj
+
+        handle = getattr(obj, "handle", None)
+        if handle is None:
+            raise TypeError(f"No se puede obtener una especificación para {type(obj).__name__}")
+
+        return Desktop(backend="win32").window(handle=handle)
+
+    def _child(self, parent, **criteria):
+        """Devuelve un WindowSpecification hijo de parent, sea spec o wrapper."""
+        return self._as_spec(parent).child_window(**criteria)
+
     def _workers_window_spec(self):
-        return self.main.child_window(
+        return self.main_spec.child_window(
             title=SYGNUS["workers_window_title"],
             control_id=SYGNUS["workers_window_id"],
             class_name=SYGNUS["workers_window_class"],
@@ -404,7 +429,7 @@ class AttendanceAutomator:
     def _workers_grid(self):
         workers = self._workers_window_spec()
         workers.wait("exists", timeout=3)
-        grid = workers.child_window(
+        grid = self._child(workers,
             control_id=SYGNUS["workers_grid_id"],
             class_name=SYGNUS["workers_grid_class"],
         )
@@ -412,7 +437,7 @@ class AttendanceAutomator:
         return grid.wrapper_object()
 
     def _find_spec(self):
-        return self.main.child_window(
+        return self.main_spec.child_window(
             title=SYGNUS["find_title"],
             class_name=SYGNUS["find_class"],
         )
@@ -443,7 +468,7 @@ class AttendanceAutomator:
         #    pero no el botón Buscar como nodo independiente.
         if not opened:
             try:
-                bar = self.main.child_window(class_name="FNFIXEDBAR105").wrapper_object()
+                bar = self._child(self.main, class_name="FNFIXEDBAR105").wrapper_object()
                 rect = bar.rectangle()
                 dx, dy = FALLBACK["toolbar_buscar_offset"]
                 mouse.click(coords=(rect.left + dx, rect.top + dy))
@@ -510,16 +535,16 @@ class AttendanceAutomator:
         win = self._open_find()
 
         try:
-            where_combo = win.child_window(
+            where_combo = self._child(win,
                 control_id=SYGNUS["find_where_combo_id"], class_name="ComboBox"
             ).wrapper_object()
-            text_edit = win.child_window(
+            text_edit = self._child(win,
                 control_id=SYGNUS["find_text_id"], class_name="Edit"
             ).wrapper_object()
-            direction_combo = win.child_window(
+            direction_combo = self._child(win,
                 control_id=SYGNUS["search_direction_combo_id"], class_name="ComboBox"
             ).wrapper_object()
-            find_next = win.child_window(
+            find_next = self._child(win,
                 control_id=SYGNUS["find_next_id"], class_name="Button"
             ).wrapper_object()
         except Exception as exc:
@@ -552,7 +577,7 @@ class AttendanceAutomator:
             return
         win = spec.wrapper_object()
         try:
-            cancel = win.child_window(control_id=SYGNUS["find_cancel_id"], class_name="Button")
+            cancel = self._child(win, control_id=SYGNUS["find_cancel_id"], class_name="Button")
             if cancel.exists(timeout=0.3):
                 cancel.click_input()
             else:
@@ -574,7 +599,7 @@ class AttendanceAutomator:
         from pywinauto import mouse
 
         self._check_cancel()
-        mov_spec = self.main.child_window(
+        mov_spec = self.main_spec.child_window(
             title=SYGNUS["movements_title"],
             control_id=SYGNUS["movements_id"],
             class_name=SYGNUS["movements_class"],
@@ -645,7 +670,7 @@ class AttendanceAutomator:
         raise RuntimeError(last_error or f"No se pudo localizar al trabajador {code}.")
 
     def _marks_pane_spec(self, mov):
-        return mov.child_window(
+        return self._child(mov,
             title=SYGNUS["marks_pane_title"],
             control_id=SYGNUS["marks_pane_id"],
             class_name=SYGNUS["marks_pane_class"],
@@ -669,7 +694,7 @@ class AttendanceAutomator:
         if self._marks_active(mov):
             return self._marks_pane_spec(mov).wrapper_object()
 
-        tabs = mov.child_window(
+        tabs = self._child(mov,
             control_id=SYGNUS["tabs_id"], class_name=SYGNUS["tabs_class"]
         )
         tabs.wait("exists", timeout=3)
@@ -704,7 +729,7 @@ class AttendanceAutomator:
         self.log("Marcaciones activa. Abriendo Nueva Marcación...")
 
         try:
-            new_button = marks.child_window(
+            new_button = self._child(marks,
                 control_id=SYGNUS["new_mark_button_id"], class_name="Button"
             )
             new_button.wait("exists enabled", timeout=3)
@@ -713,7 +738,7 @@ class AttendanceAutomator:
             raise RuntimeError("No se pudo accionar el botón Nueva Marcación (ID 1002).") from exc
 
         self._sleep("after_open_mark")
-        new_spec = self.main.child_window(
+        new_spec = self.main_spec.child_window(
             title=SYGNUS["new_mark_title"], class_name=SYGNUS["new_mark_class"]
         )
         new_spec.wait("exists visible", timeout=5)
@@ -744,7 +769,7 @@ class AttendanceAutomator:
         """
         self._check_cancel()
         try:
-            datawindow = win.child_window(
+            datawindow = self._child(win,
                 control_id=SYGNUS["new_mark_datawindow_id"],
                 class_name=SYGNUS["new_mark_datawindow_class"],
             ).wrapper_object()
@@ -756,7 +781,7 @@ class AttendanceAutomator:
         self._type_into_datawindow(datawindow, FALLBACK["hora_point"], hora)
 
         try:
-            save = win.child_window(control_id=SYGNUS["save_button_id"], class_name="Button")
+            save = self._child(win, control_id=SYGNUS["save_button_id"], class_name="Button")
             save.wait("exists enabled", timeout=3)
             save.click_input()
         except Exception as exc:
@@ -765,8 +790,10 @@ class AttendanceAutomator:
         self._sleep("after_save")
 
         # Si el formulario sigue visible, puede haber rechazado los datos o estar esperando algo.
+        # `win` es un Wrapper (no tiene exists()), por eso consultamos visibilidad
+        # y tratamos una excepción de handle inválido como señal de que la ventana cerró.
         try:
-            if win.exists(timeout=0.2) and win.is_visible():
+            if win.is_visible():
                 raise RuntimeError(
                     "Nuevo Marcación sigue abierto después de Guardar. "
                     "Revisa la Fecha/Hora o algún mensaje de validación del sistema."
