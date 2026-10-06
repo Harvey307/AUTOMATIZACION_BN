@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import queue
 import re
 import sys
@@ -20,6 +19,7 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_TITLE = "AUTOMATIZACION_BN"
+APP_VERSION = "1.1.0"
 DISPLAY_COLS = ["codigo", "nombre", "incidente", "fecha", "hora", "estado", "detalle"]
 COL_TITLES = {
     "codigo": "Código",
@@ -31,20 +31,109 @@ COL_TITLES = {
     "detalle": "Detalle",
 }
 
+# Nombres admitidos para las columnas de los Excel/TXT.
 ALIASES = {
-    "codigo": ["cod. emplea", "cod emplea", "codigo", "código", "codigo del trabajador", "cod_emplea"],
+    "codigo": [
+        "cod. empleado",
+        "cod empleado",
+        "cod. emplea",
+        "cod emplea",
+        "codigo",
+        "código",
+        "codigo del trabajador",
+        "código del trabajador",
+        "cod_emplea",
+    ],
     "nombre": ["nombre y apellidos", "nombre", "trabajador", "apellidos y nombres"],
-    "incidente": ["incidente", "detalle de incidente", "detalle de inc", "tipo incidente"],
+    "incidente": ["incidente", "tipo incidente"],
     "fecha_inicio": ["fecha inicio", "fecha", "fecha_inicio"],
     "hora_inicio": ["hora inicio", "hora_inicio", "ingreso"],
     "hora_fin": ["hora fin", "hora_fin", "salida"],
     "estado_origen": ["estado"],
 }
 
+# Valores obtenidos del mapa real de UI Automation de SYGNUS.
+SYGNUS = {
+    "main_title_regex": r"^Maestr(?:a|ía) de Asistencia$",
+    "main_class": "FNWND3105",
+    "process_name": "tar_base",
+
+    # Ventana Buscar / Find
+    "find_title": "Find",
+    "find_class": "FNWNS3105",
+    "find_where_combo_id": 1002,
+    "find_text_id": 1008,
+    "search_direction_combo_id": 1009,
+    "find_next_id": 1006,
+    "find_cancel_id": 1007,
+
+    # Lista principal de trabajadores
+    "workers_window_title": "Lista de Trabajadores",
+    "workers_window_id": 200,
+    "workers_window_class": "FNWND3105",
+    "workers_grid_id": 1000,
+    "workers_grid_class": "pbdw105",
+
+    # Ver Movimientos Trabajador
+    "movements_title": "Ver Movimientos Trabajador",
+    "movements_id": 201,
+    "movements_class": "FNWND3105",
+    "tabs_id": 1001,
+    "tabs_class": "PBTabControl32_100",
+    "marks_pane_title": "Marcaciones",
+    "marks_pane_id": 1004,
+    "marks_pane_class": "FNUDO3105",
+    "new_mark_button_id": 1002,  # botón izquierdo de la barra de Marcaciones
+
+    # Nuevo Marcación
+    "new_mark_title": "Nuevo Marcación",
+    "new_mark_class": "FNWNS3105",
+    "new_mark_datawindow_id": 1002,
+    "new_mark_datawindow_class": "pbdw105",
+    "save_button_id": 1000,
+    "close_button_id": 1001,
+}
+
+DEFAULT_DELAYS = {
+    "short": 0.25,
+    "medium": 0.65,
+    "after_search": 0.45,
+    "after_open_worker": 0.65,
+    "after_open_mark": 0.50,
+    "after_save": 0.85,
+}
+
+# Fallbacks geométricos. Se usan sólo para controles antiguos que el mapa no expone.
+# El botón Buscar no apareció como control individual en UI Automation.
+FALLBACK = {
+    # Dentro de FNFIXEDBAR105, el botón Buscar está aprox. a 335 px desde la izquierda.
+    "toolbar_buscar_offset": (335, 18),
+    # Dentro del PBTabControl32_100, cabecera de la pestaña Marcaciones.
+    "marcaciones_tab_points": [(0.355, 0.030), (0.330, 0.030), (0.385, 0.030)],
+    # Dentro del pbdw105 de "Nuevo Marcación".
+    # El DataWindow no expone Fecha/Hora como AutomationElement separados.
+    "fecha_point": (0.28, 0.17),
+    "hora_point": (0.28, 0.36),
+}
+
 
 def resource_path(name: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / name
+
+
+def load_delays() -> dict:
+    """Lee los delays del profile si existe, sin depender obligatoriamente del JSON."""
+    delays = dict(DEFAULT_DELAYS)
+    profile = resource_path("automation_profile.json")
+    try:
+        if profile.exists():
+            with open(profile, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            delays.update(data.get("delays", {}))
+    except Exception:
+        pass
+    return delays
 
 
 def normalize_col(s: str) -> str:
@@ -56,8 +145,9 @@ def normalize_col(s: str) -> str:
 def find_column(columns, aliases):
     normalized = {normalize_col(c): c for c in columns}
     for alias in aliases:
-        if normalize_col(alias) in normalized:
-            return normalized[normalize_col(alias)]
+        n_alias = normalize_col(alias)
+        if n_alias in normalized:
+            return normalized[n_alias]
     for n, original in normalized.items():
         for alias in aliases:
             a = normalize_col(alias)
@@ -81,9 +171,7 @@ def normalize_code(value) -> str:
 def normalize_date(value) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ""
-    if isinstance(value, pd.Timestamp):
-        return value.strftime("%d/%m/%Y")
-    if isinstance(value, datetime):
+    if isinstance(value, (pd.Timestamp, datetime)):
         return value.strftime("%d/%m/%Y")
     s = str(value).strip()
     if not s:
@@ -144,9 +232,12 @@ def transform_data(raw: pd.DataFrame) -> pd.DataFrame:
     name_col = find_column(raw.columns, ALIASES["nombre"])
 
     missing = []
-    if not code_col: missing.append("Código")
-    if not incident_col: missing.append("Incidente")
-    if not date_col: missing.append("Fecha inicio")
+    if not code_col:
+        missing.append("Cod. Empleado")
+    if not incident_col:
+        missing.append("Incidente")
+    if not date_col:
+        missing.append("Fecha inicio")
     if missing:
         raise ValueError("No encontré estas columnas obligatorias: " + ", ".join(missing))
 
@@ -160,15 +251,17 @@ def transform_data(raw: pd.DataFrame) -> pd.DataFrame:
             source_time = r[hf_col] if hf_col else ""
         else:
             source_time = r[hi_col] if hi_col and not pd.isna(r[hi_col]) else (r[hf_col] if hf_col else "")
-        rows.append({
-            "codigo": normalize_code(r[code_col]),
-            "nombre": "" if not name_col or pd.isna(r[name_col]) else str(r[name_col]).strip(),
-            "incidente": incident,
-            "fecha": normalize_date(r[date_col]),
-            "hora": normalize_time(source_time),
-            "estado": "PENDIENTE",
-            "detalle": "",
-        })
+        rows.append(
+            {
+                "codigo": normalize_code(r[code_col]),
+                "nombre": "" if not name_col or pd.isna(r[name_col]) else str(r[name_col]).strip(),
+                "incidente": incident,
+                "fecha": normalize_date(r[date_col]),
+                "hora": normalize_time(source_time),
+                "estado": "PENDIENTE",
+                "detalle": "",
+            }
+        )
     return pd.DataFrame(rows, columns=DISPLAY_COLS)
 
 
@@ -214,235 +307,526 @@ class AutomationResult:
 
 
 class AttendanceAutomator:
+    """
+    Automatizador específico para la UI real de Maestra de Asistencia (tar_base).
+
+    Prioridad:
+      1) IDs/clases reales obtenidos del mapa UI Automation.
+      2) teclado / menú.
+      3) coordenadas relativas sólo donde PowerBuilder no expone el control.
+    """
+
     def __init__(self, log_callback, cancel_event: threading.Event):
         self.log = log_callback
         self.cancel_event = cancel_event
-        with open(resource_path("automation_profile.json"), "r", encoding="utf-8") as f:
-            self.profile = json.load(f)
-        self.app = None
+        self.delays = load_delays()
         self.main = None
+        self.pid = None
 
     def _check_cancel(self):
         if self.cancel_event.is_set():
             raise InterruptedError("Proceso cancelado por el usuario")
 
+    def _sleep(self, key: str):
+        self._check_cancel()
+        time.sleep(float(self.delays.get(key, DEFAULT_DELAYS.get(key, 0.4))))
+        self._check_cancel()
+
+    @staticmethod
+    def _spec_exists(spec, timeout=0.25) -> bool:
+        try:
+            return bool(spec.exists(timeout=timeout))
+        except Exception:
+            return False
+
     def connect(self):
         from pywinauto import Desktop
-        self.log("Conectando con Maestría de Asistencia...")
+
+        self.log("Buscando 'Maestra de Asistencia'...")
         desktop = Desktop(backend="win32")
-        self.main = desktop.window(title_re=self.profile["main_window_regex"])
-        self.main.wait("visible", timeout=10)
-        self.main.set_focus()
-        self.log("Sistema detectado.")
 
-    def _click_relative(self, window, key):
-        from pywinauto import mouse
-        x_ratio, y_ratio = self.profile["relative_clicks"][key]
-        rect = window.rectangle()
-        x = rect.left + int(rect.width() * x_ratio)
-        y = rect.top + int(rect.height() * y_ratio)
-        mouse.click(coords=(x, y))
+        # Primero: título + clase reales del mapa.
+        main = desktop.window(
+            title_re=SYGNUS["main_title_regex"],
+            class_name=SYGNUS["main_class"],
+        )
 
-    def _click_named_or_relative(self, window, names, relative_key):
-        for name in names:
+        try:
+            main.wait("exists visible", timeout=10)
+        except Exception as exc:
+            # Diagnóstico útil: muestra las ventanas visibles que sí encontró pywinauto.
+            visible = []
             try:
-                ctrl = window.child_window(title_re=f".*{re.escape(name)}.*")
-                if ctrl.exists(timeout=0.5):
-                    ctrl.click_input()
-                    return
+                for w in desktop.windows():
+                    title = (w.window_text() or "").strip()
+                    if title:
+                        visible.append(title)
             except Exception:
                 pass
-        self._click_relative(window, relative_key)
+            sample = ", ".join(visible[:12]) if visible else "(ninguna)"
+            raise RuntimeError(
+                "No se encontró la ventana 'Maestra de Asistencia'. "
+                "Verifica que SYGNUS esté abierto en Asistencia de trabajador y que ambos programas "
+                "se ejecuten con el mismo nivel de permisos. "
+                f"Ventanas visibles: {sample}"
+            ) from exc
+
+        self.main = main.wrapper_object()
+        try:
+            self.pid = self.main.process_id()
+        except Exception:
+            self.pid = None
+
+        try:
+            self.main.set_focus()
+        except Exception:
+            pass
+
+        # Verifica además que la Lista de Trabajadores exista.
+        workers = self._workers_window_spec()
+        if not self._spec_exists(workers, timeout=1.0):
+            raise RuntimeError(
+                "Se encontró Maestra de Asistencia, pero no la ventana 'Lista de Trabajadores'. "
+                "Entra primero a la opción Asistencia de trabajador."
+            )
+
+        pid_text = f" PID={self.pid}" if self.pid else ""
+        self.log(f"Conectado a Maestra de Asistencia.{pid_text}")
+        return self.pid
+
+    def _workers_window_spec(self):
+        return self.main.child_window(
+            title=SYGNUS["workers_window_title"],
+            control_id=SYGNUS["workers_window_id"],
+            class_name=SYGNUS["workers_window_class"],
+        )
+
+    def _workers_grid(self):
+        workers = self._workers_window_spec()
+        workers.wait("exists", timeout=3)
+        grid = workers.child_window(
+            control_id=SYGNUS["workers_grid_id"],
+            class_name=SYGNUS["workers_grid_class"],
+        )
+        grid.wait("exists", timeout=3)
+        return grid.wrapper_object()
+
+    def _find_spec(self):
+        return self.main.child_window(
+            title=SYGNUS["find_title"],
+            class_name=SYGNUS["find_class"],
+        )
 
     def _open_find(self):
-        from pywinauto import Desktop
-        self._click_named_or_relative(self.main, ["Buscar"], "buscar")
-        time.sleep(self.profile["delays"]["medium"])
-        win = Desktop(backend="win32").window(title_re=self.profile["find_window_regex"])
-        win.wait("visible", timeout=5)
-        return win
+        from pywinauto import mouse
 
-    def _set_combo_text(self, combo, text):
+        self._check_cancel()
+        existing = self._find_spec()
+        if self._spec_exists(existing, timeout=0.2):
+            return existing.wrapper_object()
+
+        self.log("Abriendo Buscar...")
+
+        # 1) Intenta usar el menú nativo: evita depender del mouse.
+        opened = False
+        for menu_path in ("Acciones->Buscar", "Acciones->Buscar...", "Buscar"):
+            try:
+                self.main.menu_select(menu_path)
+                self._sleep("short")
+                if self._spec_exists(self._find_spec(), timeout=0.6):
+                    opened = True
+                    break
+            except Exception:
+                pass
+
+        # 2) Fallback al botón de la barra. El mapa expone la barra FNFIXEDBAR105,
+        #    pero no el botón Buscar como nodo independiente.
+        if not opened:
+            try:
+                bar = self.main.child_window(class_name="FNFIXEDBAR105").wrapper_object()
+                rect = bar.rectangle()
+                dx, dy = FALLBACK["toolbar_buscar_offset"]
+                mouse.click(coords=(rect.left + dx, rect.top + dy))
+            except Exception as exc:
+                raise RuntimeError("No se pudo accionar el botón Buscar.") from exc
+
+        find_spec = self._find_spec()
+        find_spec.wait("exists visible", timeout=5)
+        return find_spec.wrapper_object()
+
+    @staticmethod
+    def _set_combo(combo, text: str):
+        from pywinauto.keyboard import send_keys
+
         try:
             combo.select(text)
             return
         except Exception:
             pass
-        combo.click_input()
-        time.sleep(0.15)
-        from pywinauto.keyboard import send_keys
-        send_keys(text)
-        send_keys("{ENTER}")
-
-    def _find_worker(self, code: str):
-        from pywinauto.keyboard import send_keys
-        win = self._open_find()
-        self._check_cancel()
-
-        combos = win.descendants(class_name="ComboBox")
-        edits = win.descendants(class_name="Edit")
-        buttons = win.descendants(class_name="Button")
-
-        if combos:
-            self._set_combo_text(combos[0], "Código Del Trabajador")
-        if edits:
-            edits[0].set_edit_text(code)
-        else:
-            send_keys(code)
-
-        # Search direction: Up first.
-        if len(combos) >= 2:
-            self._set_combo_text(combos[1], "Up")
-
-        find_next = None
-        for b in buttons:
-            try:
-                if "Find Next" in b.window_text():
-                    find_next = b
-                    break
-            except Exception:
-                pass
-        if find_next:
-            find_next.click_input()
-        else:
+        try:
+            combo.click_input()
+            send_keys("^a")
+            send_keys(text, with_spaces=True)
             send_keys("{ENTER}")
-        time.sleep(self.profile["delays"]["medium"])
+        except Exception as exc:
+            raise RuntimeError(f"No se pudo seleccionar '{text}' en el combo.") from exc
 
-        # Close Find and inspect selected code in main list. If mismatch, retry Down.
+    def _detect_not_found_dialog(self) -> bool:
+        """Detecta, si existe, un diálogo de 'no encontrado' del mismo proceso."""
+        from pywinauto import Desktop
+        from pywinauto.keyboard import send_keys
+
+        if not self.pid:
+            return False
         try:
-            win.close()
-        except Exception:
-            send_keys("{ESC}")
-        time.sleep(self.profile["delays"]["short"])
-
-        if self._selected_row_contains(code):
-            return True
-
-        win = self._open_find()
-        combos = win.descendants(class_name="ComboBox")
-        edits = win.descendants(class_name="Edit")
-        if edits:
-            edits[0].set_edit_text(code)
-        if len(combos) >= 2:
-            self._set_combo_text(combos[1], "Down")
-        buttons = win.descendants(class_name="Button")
-        clicked = False
-        for b in buttons:
-            try:
-                if "Find Next" in b.window_text():
-                    b.click_input(); clicked = True; break
-            except Exception:
-                pass
-        if not clicked:
-            send_keys("{ENTER}")
-        time.sleep(self.profile["delays"]["medium"])
-        try:
-            win.close()
-        except Exception:
-            send_keys("{ESC}")
-        return self._selected_row_contains(code)
-
-    def _selected_row_contains(self, code: str) -> bool:
-        # Legacy grids are not always exposed. First inspect visible texts.
-        try:
-            texts = " ".join(x.window_text() for x in self.main.descendants() if x.window_text())
-            if code in texts:
-                return True
+            for w in Desktop(backend="win32").windows(process=self.pid):
+                title = (w.window_text() or "").strip()
+                cls = w.class_name()
+                # No confundir las ventanas conocidas con un posible MessageBox.
+                if title in {
+                    "Maestra de Asistencia",
+                    "Find",
+                    "Ver Movimientos Trabajador",
+                    "Nuevo Marcación",
+                    "Lista de Trabajadores",
+                }:
+                    continue
+                texts = " ".join(t for t in w.texts() if t).lower()
+                candidate = f"{title} {texts}".lower()
+                if cls == "#32770" and any(k in candidate for k in ("no encontr", "not found", "no existe")):
+                    try:
+                        w.set_focus()
+                        send_keys("{ENTER}")
+                    except Exception:
+                        pass
+                    return True
         except Exception:
             pass
-        # Search itself normally selects the worker; if the grid is opaque, allow continuation.
+        return False
+
+    def _search_once(self, code: str, direction: str) -> bool:
+        """Busca un código con Up o Down usando IDs reales del diálogo Find."""
+        self._check_cancel()
+        win = self._open_find()
+
+        try:
+            where_combo = win.child_window(
+                control_id=SYGNUS["find_where_combo_id"], class_name="ComboBox"
+            ).wrapper_object()
+            text_edit = win.child_window(
+                control_id=SYGNUS["find_text_id"], class_name="Edit"
+            ).wrapper_object()
+            direction_combo = win.child_window(
+                control_id=SYGNUS["search_direction_combo_id"], class_name="ComboBox"
+            ).wrapper_object()
+            find_next = win.child_window(
+                control_id=SYGNUS["find_next_id"], class_name="Button"
+            ).wrapper_object()
+        except Exception as exc:
+            raise RuntimeError("No se pudieron detectar los controles internos de Find.") from exc
+
+        self._set_combo(where_combo, "Código Del Trabajador")
+        try:
+            text_edit.set_edit_text(code)
+        except Exception:
+            text_edit.click_input()
+            from pywinauto.keyboard import send_keys
+            send_keys("^a{BACKSPACE}")
+            send_keys(code)
+        self._set_combo(direction_combo, direction)
+
+        self.log(f"Buscando trabajador {code} ({direction})...")
+        find_next.click_input()
+        self._sleep("after_search")
+
+        if self._detect_not_found_dialog():
+            self.log(f"Sin coincidencia con Search={direction}.")
+            return False
         return True
 
-    def _open_worker(self):
-        from pywinauto import Desktop
-        from pywinauto import mouse
+    def _close_find(self):
         from pywinauto.keyboard import send_keys
-        self._check_cancel()
-        # Double-click current selected row; legacy grids generally open the worker this way.
-        try:
-            focused = Desktop(backend="win32").get_active()
-            rect = self.main.rectangle()
-            mouse.double_click(coords=(rect.left + int(rect.width()*0.35), rect.top + int(rect.height()*0.40)))
-        except Exception:
-            send_keys("{ENTER}")
-        time.sleep(self.profile["delays"]["medium"])
-        mov = Desktop(backend="win32").window(title_re=self.profile["movements_window_regex"])
-        if not mov.exists(timeout=1):
-            send_keys("{ENTER}")
-        mov.wait("visible", timeout=5)
-        return mov
 
-    def _open_new_mark(self, mov):
-        from pywinauto import Desktop
-        self._check_cancel()
-        # Try Marcaciones tab by visible text, otherwise relative position.
-        clicked = False
+        spec = self._find_spec()
+        if not self._spec_exists(spec, timeout=0.1):
+            return
+        win = spec.wrapper_object()
         try:
-            for c in mov.descendants():
-                if "Marcaciones" in c.window_text():
-                    c.click_input(); clicked = True; break
+            cancel = win.child_window(control_id=SYGNUS["find_cancel_id"], class_name="Button")
+            if cancel.exists(timeout=0.3):
+                cancel.click_input()
+            else:
+                send_keys("{ESC}")
+        except Exception:
+            try:
+                send_keys("{ESC}")
+            except Exception:
+                pass
+        self._sleep("short")
+
+    def _try_open_worker(self, timeout=2.5):
+        """
+        Abre el trabajador seleccionado. PowerBuilder no expone las filas de la grilla;
+        se intenta actuar sobre la fila actual mediante teclado y, como respaldo, sobre
+        la primera fila visible de la DataWindow.
+        """
+        from pywinauto.keyboard import send_keys
+        from pywinauto import mouse
+
+        self._check_cancel()
+        mov_spec = self.main.child_window(
+            title=SYGNUS["movements_title"],
+            control_id=SYGNUS["movements_id"],
+            class_name=SYGNUS["movements_class"],
+        )
+
+        # Si ya está abierto, reutilizarlo.
+        if self._spec_exists(mov_spec, timeout=0.1):
+            return mov_spec.wrapper_object()
+
+        grid = self._workers_grid()
+
+        # Intento 1: Enter sobre la selección actual que dejó Find Next.
+        try:
+            grid.set_focus()
         except Exception:
             pass
-        if not clicked:
-            self._click_relative(mov, "marcaciones_tab")
-        time.sleep(self.profile["delays"]["short"])
+        try:
+            send_keys("{ENTER}")
+            if mov_spec.exists(timeout=1.0):
+                mov_spec.wait("visible", timeout=1.0)
+                return mov_spec.wrapper_object()
+        except Exception:
+            pass
 
-        # New-mark icon has no reliable caption in the legacy UI.
-        self._click_relative(mov, "new_mark")
-        time.sleep(self.profile["delays"]["medium"])
-        new = Desktop(backend="win32").window(title_re=self.profile["new_mark_window_regex"])
-        new.wait("visible", timeout=5)
-        return new
+        # Intento 2: clic en la primera fila visible; Find suele desplazar la coincidencia.
+        try:
+            rect = grid.rectangle()
+            mouse.click(coords=(rect.left + 120, rect.top + 18))
+            if mov_spec.exists(timeout=0.8):
+                mov_spec.wait("visible", timeout=1.0)
+                return mov_spec.wrapper_object()
+        except Exception:
+            pass
+
+        # Intento 3: doble clic en esa misma fila.
+        try:
+            rect = grid.rectangle()
+            mouse.double_click(coords=(rect.left + 120, rect.top + 18), interval=0.12)
+            mov_spec.wait("exists visible", timeout=timeout)
+            return mov_spec.wrapper_object()
+        except Exception:
+            return None
+
+    def _find_and_open_worker(self, code: str):
+        """
+        Ejecuta la regla de negocio indicada por el usuario:
+        buscar Up primero y, si no permite abrir el trabajador, repetir con Down.
+        """
+        last_error = None
+        for direction in ("Up", "Down"):
+            self._check_cancel()
+            try:
+                searched = self._search_once(code, direction)
+                self._close_find()
+                if not searched:
+                    continue
+                mov = self._try_open_worker()
+                if mov is not None:
+                    self.log(f"Trabajador {code} abierto correctamente.")
+                    return mov
+                last_error = f"No se pudo abrir el trabajador después de buscar {direction}."
+                self.log(last_error)
+            except Exception as exc:
+                last_error = str(exc)
+                self._close_find()
+                self.log(f"Intento {direction} falló: {exc}")
+
+        raise RuntimeError(last_error or f"No se pudo localizar al trabajador {code}.")
+
+    def _marks_pane_spec(self, mov):
+        return mov.child_window(
+            title=SYGNUS["marks_pane_title"],
+            control_id=SYGNUS["marks_pane_id"],
+            class_name=SYGNUS["marks_pane_class"],
+        )
+
+    def _marks_active(self, mov) -> bool:
+        pane = self._marks_pane_spec(mov)
+        try:
+            if not pane.exists(timeout=0.15):
+                return False
+            w = pane.wrapper_object()
+            return w.is_visible() and w.is_enabled()
+        except Exception:
+            return False
+
+    def _activate_marks_tab(self, mov):
+        from pywinauto import mouse
+        from pywinauto.keyboard import send_keys
+
+        self._check_cancel()
+        if self._marks_active(mov):
+            return self._marks_pane_spec(mov).wrapper_object()
+
+        tabs = mov.child_window(
+            control_id=SYGNUS["tabs_id"], class_name=SYGNUS["tabs_class"]
+        )
+        tabs.wait("exists", timeout=3)
+        tab = tabs.wrapper_object()
+
+        # PowerBuilder no expone los TabItem. Se pulsa la zona de la cabecera "Marcaciones"
+        # y se valida que aparezca el FNUDO3105 con ID 1004.
+        rect = tab.rectangle()
+        for xr, yr in FALLBACK["marcaciones_tab_points"]:
+            self._check_cancel()
+            mouse.click(coords=(rect.left + int(rect.width() * xr), rect.top + int(rect.height() * yr)))
+            self._sleep("short")
+            if self._marks_active(mov):
+                return self._marks_pane_spec(mov).wrapper_object()
+
+        # Último respaldo: ciclar pestañas con Ctrl+Tab.
+        try:
+            tab.set_focus()
+        except Exception:
+            pass
+        for _ in range(6):
+            send_keys("^{TAB}")
+            self._sleep("short")
+            if self._marks_active(mov):
+                return self._marks_pane_spec(mov).wrapper_object()
+
+        raise RuntimeError("No se pudo activar la pestaña Marcaciones.")
+
+    def _open_new_mark(self, mov):
+        self._check_cancel()
+        marks = self._activate_marks_tab(mov)
+        self.log("Marcaciones activa. Abriendo Nueva Marcación...")
+
+        try:
+            new_button = marks.child_window(
+                control_id=SYGNUS["new_mark_button_id"], class_name="Button"
+            )
+            new_button.wait("exists enabled", timeout=3)
+            new_button.click_input()
+        except Exception as exc:
+            raise RuntimeError("No se pudo accionar el botón Nueva Marcación (ID 1002).") from exc
+
+        self._sleep("after_open_mark")
+        new_spec = self.main.child_window(
+            title=SYGNUS["new_mark_title"], class_name=SYGNUS["new_mark_class"]
+        )
+        new_spec.wait("exists visible", timeout=5)
+        return new_spec.wrapper_object()
+
+    @staticmethod
+    def _click_ratio(control, point):
+        from pywinauto import mouse
+
+        xr, yr = point
+        rect = control.rectangle()
+        mouse.click(coords=(rect.left + int(rect.width() * xr), rect.top + int(rect.height() * yr)))
+
+    def _type_into_datawindow(self, datawindow, point, value: str):
+        from pywinauto.keyboard import send_keys
+
+        self._click_ratio(datawindow, point)
+        time.sleep(0.12)
+        send_keys("^a{BACKSPACE}")
+        send_keys(value, with_spaces=True)
+        time.sleep(0.12)
 
     def _fill_and_save(self, win, fecha: str, hora: str):
+        """
+        El mapa de UI Automation muestra Fecha/Hora dentro de un único pbdw105 (ID 1002),
+        no como Edit separados. Por eso se escriben por posición relativa dentro del DataWindow.
+        Guardar sí está expuesto de forma estable como Button ID 1000.
+        """
         self._check_cancel()
-        edits = win.descendants(class_name="Edit")
-        # In the shown dialog the first editable field is Fecha and the next is Hora.
-        if len(edits) < 2:
-            raise RuntimeError("No se detectaron los campos Fecha y Hora en Nuevo Marcación.")
-        edits[0].set_edit_text(fecha)
-        edits[1].set_edit_text(hora)
+        try:
+            datawindow = win.child_window(
+                control_id=SYGNUS["new_mark_datawindow_id"],
+                class_name=SYGNUS["new_mark_datawindow_class"],
+            ).wrapper_object()
+        except Exception as exc:
+            raise RuntimeError("No se detectó el formulario interno de Nuevo Marcación (pbdw105 ID 1002).") from exc
 
-        saved = False
-        for b in win.descendants(class_name="Button"):
+        self.log(f"Ingresando Fecha={fecha} Hora={hora}...")
+        self._type_into_datawindow(datawindow, FALLBACK["fecha_point"], fecha)
+        self._type_into_datawindow(datawindow, FALLBACK["hora_point"], hora)
+
+        try:
+            save = win.child_window(control_id=SYGNUS["save_button_id"], class_name="Button")
+            save.wait("exists enabled", timeout=3)
+            save.click_input()
+        except Exception as exc:
+            raise RuntimeError("No se pudo accionar Guardar (ID 1000).") from exc
+
+        self._sleep("after_save")
+
+        # Si el formulario sigue visible, puede haber rechazado los datos o estar esperando algo.
+        try:
+            if win.exists(timeout=0.2) and win.is_visible():
+                raise RuntimeError(
+                    "Nuevo Marcación sigue abierto después de Guardar. "
+                    "Revisa la Fecha/Hora o algún mensaje de validación del sistema."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            # Si la ventana ya no existe, el guardado/close fue correcto.
+            pass
+
+    def _close_movements(self, mov):
+        try:
+            mov.close()
+            self._sleep("short")
+        except Exception:
             try:
-                if "Guardar" in b.window_text():
-                    b.click_input(); saved = True; break
+                from pywinauto.keyboard import send_keys
+                mov.set_focus()
+                send_keys("%{F4}")
+                self._sleep("short")
             except Exception:
                 pass
-        if not saved:
-            from pywinauto.keyboard import send_keys
-            send_keys("{ENTER}")
-        time.sleep(self.profile["delays"]["after_save"])
 
     def process_row(self, code: str, fecha: str, hora: str) -> AutomationResult:
+        mov = None
         try:
             self._check_cancel()
-            self.main.set_focus()
-            if not self._find_worker(code):
-                return AutomationResult(False, "Trabajador no encontrado")
-            mov = self._open_worker()
-            new = self._open_new_mark(mov)
-            self._fill_and_save(new, fecha, hora)
-            # Return to main worker list for next record.
             try:
-                mov.close()
+                self.main.set_focus()
             except Exception:
                 pass
-            time.sleep(self.profile["delays"]["short"])
-            return AutomationResult(True, "Marcación creada")
+
+            mov = self._find_and_open_worker(code)
+            self._sleep("after_open_worker")
+            new = self._open_new_mark(mov)
+            self._fill_and_save(new, fecha, hora)
+            self._close_movements(mov)
+            return AutomationResult(True, "Marcación creada correctamente")
         except InterruptedError:
             raise
-        except Exception as e:
-            return AutomationResult(False, f"{type(e).__name__}: {e}")
+        except Exception as exc:
+            # Intentar volver a un estado utilizable para continuar con la siguiente fila.
+            try:
+                self._close_find()
+            except Exception:
+                pass
+            try:
+                if mov is not None:
+                    self._close_movements(mov)
+            except Exception:
+                pass
+            return AutomationResult(False, f"{type(exc).__name__}: {exc}")
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_TITLE)
-        self.geometry("1180x720")
-        self.minsize(950, 600)
+        self.title(f"{APP_TITLE} - v{APP_VERSION}")
+        self.geometry("1210x740")
+        self.minsize(980, 620)
         self.df = pd.DataFrame(columns=DISPLAY_COLS)
         self.file_path = None
         self.worker = None
@@ -459,19 +843,34 @@ class App(tk.Tk):
         ttk.Button(top, text="Modificar", command=self.edit_row).pack(side="left", padx=4)
         ttk.Button(top, text="Eliminar", command=self.delete_row).pack(side="left", padx=4)
         ttk.Button(top, text="Exportar resultado", command=self.export_result).pack(side="left", padx=4)
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
+        self.test_btn = ttk.Button(top, text="Probar conexión", command=self.test_connection)
+        self.test_btn.pack(side="left", padx=4)
 
         self.start_btn = ttk.Button(top, text="Iniciar automatización", command=self.start_automation)
         self.start_btn.pack(side="right", padx=4)
         self.cancel_btn = ttk.Button(top, text="Cancelar", command=self.cancel_automation, state="disabled")
         self.cancel_btn.pack(side="right", padx=4)
 
-        self.file_label = ttk.Label(self, text="Ningún archivo cargado", padding=(12, 0))
-        self.file_label.pack(fill="x")
+        info = ttk.Frame(self, padding=(12, 0, 12, 4))
+        info.pack(fill="x")
+        self.file_label = ttk.Label(info, text="Ningún archivo cargado")
+        self.file_label.pack(side="left", fill="x", expand=True)
+        self.connection_label = ttk.Label(info, text="Sistema: no probado")
+        self.connection_label.pack(side="right")
 
         table_frame = ttk.Frame(self, padding=10)
         table_frame.pack(fill="both", expand=True)
         self.tree = ttk.Treeview(table_frame, columns=DISPLAY_COLS, show="headings", selectmode="browse")
-        widths = {"codigo":90,"nombre":250,"incidente":180,"fecha":100,"hora":75,"estado":110,"detalle":280}
+        widths = {
+            "codigo": 90,
+            "nombre": 250,
+            "incidente": 160,
+            "fecha": 100,
+            "hora": 75,
+            "estado": 110,
+            "detalle": 330,
+        }
         for c in DISPLAY_COLS:
             self.tree.heading(c, text=COL_TITLES[c])
             self.tree.column(c, width=widths[c], minwidth=60, anchor="w")
@@ -483,18 +882,18 @@ class App(tk.Tk):
         x.grid(row=1, column=0, sticky="ew")
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
-        self.tree.bind("<Double-1>", lambda e: self.edit_row())
+        self.tree.bind("<Double-1>", lambda _e: self.edit_row())
 
         bottom = ttk.Frame(self, padding=10)
         bottom.pack(fill="x")
         self.progress = ttk.Progressbar(bottom, mode="determinate")
         self.progress.pack(fill="x")
         self.status = ttk.Label(bottom, text="Listo")
-        self.status.pack(anchor="w", pady=(5,0))
+        self.status.pack(anchor="w", pady=(5, 0))
 
         log_frame = ttk.LabelFrame(self, text="Registro de ejecución", padding=5)
-        log_frame.pack(fill="both", padx=10, pady=(0,10))
-        self.log_text = tk.Text(log_frame, height=7, wrap="word", state="disabled")
+        log_frame.pack(fill="both", padx=10, pady=(0, 10))
+        self.log_text = tk.Text(log_frame, height=8, wrap="word", state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
     def log(self, text):
@@ -509,7 +908,7 @@ class App(tk.Tk):
     def load_file(self):
         path = filedialog.askopenfilename(
             title="Seleccionar Excel o TXT",
-            filetypes=[("Excel/TXT", "*.xlsx *.xlsm *.xls *.txt *.csv"), ("Todos", "*.*")]
+            filetypes=[("Excel/TXT", "*.xlsx *.xlsm *.xls *.txt *.csv"), ("Todos", "*.*")],
         )
         if not path:
             return
@@ -521,8 +920,8 @@ class App(tk.Tk):
             self.file_label.config(text=path)
             self.refresh_tree()
             self.status.config(text=f"{len(self.df)} registros cargados")
-        except Exception as e:
-            messagebox.showerror("Error al cargar", str(e))
+        except Exception as exc:
+            messagebox.showerror("Error al cargar", str(exc))
 
     def selected_index(self) -> Optional[int]:
         sel = self.tree.selection()
@@ -565,13 +964,43 @@ class App(tk.Tk):
             self.df.to_excel(path, index=False)
             messagebox.showinfo("Exportar", "Archivo guardado correctamente.")
 
-    def validate_rows(self):
+    def validate_rows(self, indices=None):
         errors = []
-        for i, r in self.df.iterrows():
-            if not str(r["codigo"]).strip(): errors.append(f"Fila {i+1}: código vacío")
-            if not str(r["fecha"]).strip(): errors.append(f"Fila {i+1}: fecha vacía")
-            if not str(r["hora"]).strip(): errors.append(f"Fila {i+1}: hora vacía")
+        indices = list(self.df.index if indices is None else indices)
+        for i in indices:
+            r = self.df.loc[i]
+            if not str(r["codigo"]).strip():
+                errors.append(f"Fila {i + 1}: código vacío")
+            if not str(r["fecha"]).strip():
+                errors.append(f"Fila {i + 1}: fecha vacía")
+            if not str(r["hora"]).strip():
+                errors.append(f"Fila {i + 1}: hora vacía")
         return errors
+
+    def _pending_indices(self):
+        # Seguridad contra duplicados durante la misma sesión: no reprocesar REGISTRADO.
+        return [
+            idx
+            for idx in self.df.index
+            if str(self.df.at[idx, "estado"]).strip().upper() != "REGISTRADO"
+        ]
+
+    def test_connection(self):
+        if self.worker and self.worker.is_alive():
+            return
+        self.test_btn.config(state="disabled")
+        self.connection_label.config(text="Sistema: comprobando...")
+
+        def worker():
+            try:
+                temp_cancel = threading.Event()
+                auto = AttendanceAutomator(self.log, temp_cancel)
+                pid = auto.connect()
+                self.events.put(("connection", True, f"Conectado - PID {pid}" if pid else "Conectado"))
+            except Exception as exc:
+                self.events.put(("connection", False, str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def start_automation(self):
         if self.worker and self.worker.is_alive():
@@ -579,21 +1008,35 @@ class App(tk.Tk):
         if self.df.empty:
             messagebox.showwarning("Sin datos", "Carga primero un Excel/TXT.")
             return
-        errors = self.validate_rows()
+
+        pending = self._pending_indices()
+        if not pending:
+            messagebox.showinfo("Sin pendientes", "Todos los registros ya figuran como REGISTRADO.")
+            return
+
+        errors = self.validate_rows(pending)
         if errors:
             messagebox.showerror("Datos incompletos", "\n".join(errors[:15]))
             return
+
         if not messagebox.askyesno(
             "Confirmar automatización",
-            "Abre Maestría de Asistencia y déjala visible.\n\n¿Deseas iniciar el registro de marcaciones?"
+            "Antes de continuar:\n"
+            "1. Abre SYGNUS.\n"
+            "2. Entra a Asistencia de trabajador.\n"
+            "3. Deja visible la Lista de Trabajadores.\n\n"
+            f"Se procesarán {len(pending)} registros pendientes.\n\n"
+            "¿Deseas iniciar?",
         ):
             return
+
         self.cancel_event.clear()
         self.start_btn.config(state="disabled")
+        self.test_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
-        self.progress["maximum"] = len(self.df)
+        self.progress["maximum"] = len(pending)
         self.progress["value"] = 0
-        self.worker = threading.Thread(target=self._automation_worker, daemon=True)
+        self.worker = threading.Thread(target=self._automation_worker, args=(pending,), daemon=True)
         self.worker.start()
 
     def cancel_automation(self):
@@ -601,30 +1044,36 @@ class App(tk.Tk):
         self.status.config(text="Cancelando...")
         self.log("Se solicitó cancelar el proceso.")
 
-    def _automation_worker(self):
+    def _automation_worker(self, indices):
         try:
             automator = AttendanceAutomator(self.log, self.cancel_event)
-            automator.connect()
+            pid = automator.connect()
+            self.events.put(("connection", True, f"Conectado - PID {pid}" if pid else "Conectado"))
+
             processed = 0
-            for idx in self.df.index:
+            for idx in indices:
                 if self.cancel_event.is_set():
                     raise InterruptedError()
+
                 code = str(self.df.at[idx, "codigo"])
                 fecha = str(self.df.at[idx, "fecha"])
                 hora = str(self.df.at[idx, "hora"])
-                self.events.put(("row", idx, "PROCESANDO", ""))
-                self.log(f"[{idx+1}/{len(self.df)}] {code} - {fecha} {hora}")
+                self.events.put(("row", idx, "PROCESANDO", "Buscando trabajador"))
+                self.log(f"[{processed + 1}/{len(indices)}] {code} - {fecha} {hora}")
+
                 result = automator.process_row(code, fecha, hora)
                 state = "REGISTRADO" if result.ok else "ERROR"
                 self.events.put(("row", idx, state, result.detail))
                 processed += 1
                 self.events.put(("progress", processed))
+
             self.events.put(("done", "Proceso finalizado."))
         except InterruptedError:
             self.events.put(("done", "Proceso cancelado por el usuario."))
-        except Exception as e:
+        except Exception as exc:
             self.log(traceback.format_exc())
-            self.events.put(("done", f"Error general: {e}"))
+            self.events.put(("connection", False, str(exc)))
+            self.events.put(("done", f"Error general: {exc}"))
 
     def _drain_events(self):
         try:
@@ -647,8 +1096,18 @@ class App(tk.Tk):
                     self.status.config(text=f"{self.df.at[idx, 'codigo']}: {state}")
                 elif evt[0] == "progress":
                     self.progress["value"] = evt[1]
+                elif evt[0] == "connection":
+                    _, ok, detail = evt
+                    self.connection_label.config(text=f"Sistema: {'CONECTADO' if ok else 'NO CONECTADO'}")
+                    if ok:
+                        self.status.config(text=detail)
+                    else:
+                        self.status.config(text=detail)
+                        self.log(f"Conexión: {detail}")
+                    self.test_btn.config(state="normal")
                 elif evt[0] == "done":
                     self.start_btn.config(state="normal")
+                    self.test_btn.config(state="normal")
                     self.cancel_btn.config(state="disabled")
                     self.status.config(text=evt[1])
                     self.log(evt[1])
